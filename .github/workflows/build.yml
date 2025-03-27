@@ -1,0 +1,44 @@
+name: 'buildpackage'
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  pkgbuild:
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      matrix:
+        pkgbuild: ["PKGBUILD"]
+        branch: [unstable]
+        runs-on: [ubuntu-22.04-arm, ubuntu-22.04]
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      image: docker://manjarolinux/build:latest
+    steps:
+      - name: check out repo for action code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - id: version
+        uses: manjaro-contrib/action-pkgbuild-info@main
+        with:
+          pkgbuild: ${{ matrix.pkgbuild }}
+      - name: pkgbuild
+        if: steps.skip.outputs.skip != 'true'
+        uses: ./
+        with:
+          pkgbuild: ${{ matrix.pkgbuild }}
+          dispatch-token: ${{ secrets.DISPATCH }}
+          branch: ${{ matrix.branch }}
+          release: ${{ matrix.branch }}-${{ steps.version.outputs.version }}
+          additional_repo: >
+            [nemomobile]\n
+            SigLevel = Optional TrustAll\n
+            Server = https://img.nemomobile.net/manjaro/${{ matrix.branch }}/\$arch\n
