@@ -1,0 +1,114 @@
+name: 'manjaro makepkg action'
+description: 'builds packages for manjaro linux'
+
+inputs:
+  pkgbuild:
+    description: 'path of the PKGBUILD file'
+    default: "PKGBUILD"
+    required: false
+  dispatch-token:
+    description: token required for dispatch
+    required: false
+  dispatch-target:
+    description: repository managing your packages
+    required: false
+  branch:
+    description: manjaro branch to publish against
+    required: false
+    default: "stable"
+  additional_gpg:
+    description: 'key ids to import before building'
+    required: false
+    default: ""
+  additional_repo:
+    description: 'repository to place infront of other pacman repositories'
+    required: false
+  gpg_secret_base64:
+    description: 'base64 encoded key used to sign the package with'
+    required: false
+  release:
+    description: name of the release to be created
+    required: true
+  passphrase:
+    description: passphrase of gpg
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: install some tools
+      shell: bash
+      run: sudo pacman -Sy --noconfirm --needed base-devel github-cli
+    - name: check out repo
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - name: set up gpg
+      shell: bash
+      if: ${{ inputs.additional_gpg != '' }}
+      env:
+        KEYSERVER: keyserver.ubuntu.com
+      run: |
+        for key in ${{ inputs.additional_gpg }}
+        do
+          sudo -u builder gpg --keyserver "$KEYSERVER" --recv-key $key
+          pacman-key --keyserver "$KEYSERVER" --recv-keys $key
+        done
+    - name: set up additional repos
+      shell: bash
+      if: ${{ inputs.additional_repo != '' }}
+      run: |
+        sed -i '/^\[core\]/i \Include = /etc/pacman.d/additional_repo\n' /etc/pacman.conf
+        printf "${{ inputs.additional_repo }}" >/etc/pacman.d/additional_repo
+    - name: set up pacman for multilib repository
+      shell: bash
+      run: |
+        if [ $(uname -m) == x86_64 ]; then
+          sed -i "/\[multilib\]/,/Include/"'s/^#//' /etc/pacman.conf
+        else
+          exit 0
+        fi
+    - name: set up pacman for target branch
+      shell: bash
+      run: |
+        pacman-mirrors --geoip --api --set-branch "${{ inputs.branch }}"
+        pacman -Syyu --noconfirm
+    - name: build
+      shell: bash
+      run: |
+        mkdir -p "${PWD}/artifacts"
+        mkdir -p "${PWD}/build"
+        pacman -S --noconfirm pacman
+        chown builder $PWD
+        sudo -u builder makepkg -fsAc --noconfirm --noprogressbar -p ${{ inputs.pkgbuild }}
+        cp *.pkg.tar.zst* $PWD/artifacts/
+    - name: sign
+      shell: bash
+      if: ${{ inputs.gpg_secret_base64 != '' }}
+      run: |
+        # import signing key (no passphrase)
+        cat <(echo -e "${{ inputs.gpg_secret_base64 }}" | base64 --decode) | gpg --batch --import
+
+        for file in ./artifacts/*.pkg.tar.zst; do 
+          if [ -z ${{ inputs.passphrase }} ]; then
+            gpg --pinentry-mode loopback --detach-sign ${file}
+          else
+            gpg --pinentry-mode loopback --detach-sign --passphrase ${{ inputs.passphrase }} ${file}
+          fi
+        done
+    - name: release
+      shell: bash
+      run: |
+        echo ${{ github.token }} | gh auth login --with-token
+        gh release create ${{ inputs.release }} --repo ${{ github.repository }} || echo "release already exists"
+        gh release upload ${{ inputs.release }} --repo ${{ github.repository }} --clobber ./artifacts/*.zst
+
+        if ls ./artifacts/*.sig >/dev/null 2>&1; then 
+          gh release upload ${{ inputs.release }} --repo ${{ github.repository }} --clobber ./artifacts/*.sig
+        fi
+    - name: dispatch
+      if: ${{ inputs.dispatch-token != '' && inputs.dispatch-target != '' }}
+      uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+      with:
+        token: ${{ inputs.dispatch-token }}
+        repository: ${{ inputs.dispatch-target }}
+        event-type: package_update
+        client-payload: '{ "repository": "${{ github.repository }}", "release": "${{ inputs.release }}", "branch": "${{ inputs.branch }}" }'
